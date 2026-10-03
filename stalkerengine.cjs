@@ -123,33 +123,40 @@ async function createStreamLink(auth, config, stalkerCmd, type, sNum = null) {
 
     const opts = getAxiosOpts(config, { headers: auth.authData.headers, timeout: 5000 }, config.proxy);
 
-    // Tentativa 1: comando original (cmd)
-    let linkUrl = `${auth.api}type=${cmdType}&action=create_link&cmd=${encodeURIComponent(realCmd)}${seriesParam}&sn=${auth.authData.sn}&token=${auth.token}${chCheck}&long_lived=1&JsHttpRequest=1-0`;
-    let res = await axios.get(linkUrl, opts).catch(() => ({}));
-    let url = extractUrl(res.data?.js);
+    // Lista de variantes, por ordem de tentativa
+    const variants = [
+        // 1. cmd sem long_lived (o que funciona no HuggingFace)
+        { url: () => `${auth.api}type=${cmdType}&action=create_link&cmd=${encodeURIComponent(realCmd)}${seriesParam}&sn=${auth.authData.sn}&token=${auth.token}${chCheck}&JsHttpRequest=1-0` },
+        // 2. cmd com long_lived
+        { url: () => `${auth.api}type=${cmdType}&action=create_link&cmd=${encodeURIComponent(realCmd)}${seriesParam}&sn=${auth.authData.sn}&token=${auth.token}${chCheck}&long_lived=1&JsHttpRequest=1-0` },
+        // 3. video_id sem long_lived
+        { url: () => `${auth.api}type=${cmdType}&action=create_link&video_id=${encodeURIComponent(realCmd)}${seriesParam}&sn=${auth.authData.sn}&token=${auth.token}${chCheck}&JsHttpRequest=1-0` },
+        // 4. video_id com long_lived
+        { url: () => `${auth.api}type=${cmdType}&action=create_link&video_id=${encodeURIComponent(realCmd)}${seriesParam}&sn=${auth.authData.sn}&token=${auth.token}${chCheck}&long_lived=1&JsHttpRequest=1-0` }
+    ];
 
-    // Tentativa 2: video_id
-    if (!url) {
-        linkUrl = `${auth.api}type=${cmdType}&action=create_link&video_id=${encodeURIComponent(realCmd)}${seriesParam}&sn=${auth.authData.sn}&token=${auth.token}${chCheck}&long_lived=1&JsHttpRequest=1-0`;
-        res = await axios.get(linkUrl, opts).catch(() => ({}));
-        url = extractUrl(res.data?.js);
+    // Séries — variantes adicionais
+    if (type === "series") {
+        variants.push({ url: () => `${auth.api}type=series&action=create_link&video_id=${encodeURIComponent(realCmd)}${seriesParam}&sn=${auth.authData.sn}&token=${auth.token}${chCheck}&JsHttpRequest=1-0` });
+        variants.push({ url: () => `${auth.api}type=series&action=create_link&video_id=${encodeURIComponent(realCmd)}${seriesParam}&sn=${auth.authData.sn}&token=${auth.token}${chCheck}&long_lived=1&JsHttpRequest=1-0` });
     }
 
-    // Tentativa 3: para séries
-    if (!url && type === "series") {
-        linkUrl = `${auth.api}type=series&action=create_link&video_id=${encodeURIComponent(realCmd)}${seriesParam}&sn=${auth.authData.sn}&token=${auth.token}${chCheck}&long_lived=1&JsHttpRequest=1-0`;
-        res = await axios.get(linkUrl, opts).catch(() => ({}));
-        url = extractUrl(res.data?.js);
+    // Filmes e séries — movie_id
+    if (type === "series" || type === "movie") {
+        variants.push({ url: () => `${auth.api}type=vod&action=create_link&movie_id=${encodeURIComponent(realCmd)}${seriesParam}&sn=${auth.authData.sn}&token=${auth.token}${chCheck}&JsHttpRequest=1-0` });
+        variants.push({ url: () => `${auth.api}type=vod&action=create_link&movie_id=${encodeURIComponent(realCmd)}${seriesParam}&sn=${auth.authData.sn}&token=${auth.token}${chCheck}&long_lived=1&JsHttpRequest=1-0` });
     }
 
-    // Tentativa 4: movie_id (para filmes e séries)
-    if (!url && (type === "series" || type === "movie")) {
-        linkUrl = `${auth.api}type=vod&action=create_link&movie_id=${encodeURIComponent(realCmd)}${seriesParam}&sn=${auth.authData.sn}&token=${auth.token}${chCheck}&long_lived=1&JsHttpRequest=1-0`;
-        res = await axios.get(linkUrl, opts).catch(() => ({}));
-        url = extractUrl(res.data?.js);
+    // Tentar cada variante até uma devolver URL válido
+    for (const v of variants) {
+        try {
+            const res = await axios.get(v.url(), opts).catch(() => ({}));
+            const url = extractUrl(res.data?.js);
+            if (url) return url;
+        } catch(e) { continue; }
     }
 
-    return url;
+    return null;
 }
 
 function extractUrl(jsData) {
@@ -158,9 +165,46 @@ function extractUrl(jsData) {
     if (!url && typeof jsData === 'object') {
         url = Object.values(jsData).find(v => typeof v === 'string' && (v.startsWith('http') || v.includes('://')));
     }
+    if (!url) return null;
+
+    // 1. Remover prefixos ffmpeg/ffrt/rtmp e limpar whitespace
+    url = url.trim().replace(/^['"`]?(ffrt|ffmpeg|ffrt2|rtmp)['"`]?\s+/i, "").trim();
+    url = url.replace(/[\s\t\r\n]+/g, "");
+
+    // 2. Tentar reparar duplicação de domínio APENAS se a URL for válida
+    try {
+        const u = new URL(url);
+        const parts = u.pathname.split('/').filter(Boolean);
+        const domainLikeRe = /^[a-z0-9-]+(\.[a-z0-9-]+)+(:\d+)?$/i;
+
+        for (let i = 1; i < parts.length - 1; i++) {
+            if (domainLikeRe.test(parts[i]) && parts[i + 1] === parts[0]) {
+                const last = parts[parts.length - 1];
+                const fixedPath = '/' + [...parts.slice(0, i), last].join('/');
+                const fixedUrl = `${u.protocol}//${u.host}${fixedPath}${u.search}`;
+                console.log(`[URL FIX] ${fixedUrl}`);
+                return fixedUrl;
+            }
+        }
+
+        // URL válida mas sem duplicação → devolve como está
+        return url;
+    } catch(e) {
+        // URL inválida (ex: tem TAB, mangled) → devolve raw para o portal decidir
+        console.log(`[URL RAW] URL inválida, a devolver raw: ${url.substring(0, 80)}`);
+        return url;
+    }
+}
+/*
+function extractUrl(jsData) {
+    if (!jsData) return null;
+    let url = jsData?.cmd || jsData?.url || (typeof jsData === 'string' ? jsData : null);
+    if (!url && typeof jsData === 'object') {
+        url = Object.values(jsData).find(v => typeof v === 'string' && (v.startsWith('http') || v.includes('://')));
+    }
     return url ? url.trim().replace(/^(ffrt|ffmpeg|ffrt2|rtmp)\s+/i, "") : null;
 }
-
+*/
 // ============================================================
 // 3. RELAY FFMPEG (unificado, com proxy)
 // ============================================================
