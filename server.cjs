@@ -7,6 +7,96 @@ const { spawn } = require('child_process');
 const engine = require("./stalkerengine.cjs");
 const addon = require("./addon.cjs");
 
+// ===== LIMPA URLs MANGLED DO PORTAL =====
+function extractUrlFix(jsData) {
+    if (!jsData) return null;
+    let url = jsData?.cmd || jsData?.url || (typeof jsData === 'string' ? jsData : null);
+    if (!url && typeof jsData === 'object') {
+        url = Object.values(jsData).find(v => typeof v === 'string' && (v.startsWith('http') || v.includes('://')));
+    }
+    if (!url) return null;
+
+    url = url.trim().replace(/^['"`]?(ffrt|ffmpeg|ffrt2|rtmp)['"`]?\s+/i, "").trim();
+    url = url.replace(/[\s\t\r\n]+/g, "");
+
+    try {
+        const u = new URL(url);
+        const parts = u.pathname.split('/').filter(Boolean);
+        const domainLikeRe = /^[a-z0-9-]+(\.[a-z0-9-]+)+(:\d+)?$/i;
+
+        for (let i = 1; i < parts.length - 1; i++) {
+            if (domainLikeRe.test(parts[i]) && parts[i + 1] === parts[0]) {
+                const last = parts[parts.length - 1];
+                const fixedPath = '/' + [...parts.slice(0, i), last].join('/');
+                const fixedUrl = `${u.protocol}//${u.host}${fixedPath}${u.search}`;
+                console.log(`[URL FIX] ${fixedUrl}`);
+                return fixedUrl;
+            }
+        }
+        return url;
+    } catch(e) {
+        return url;
+    }
+}
+
+// ============================================================
+// KEEP-ALIVE: mantém a sessão do portal viva (como um MAG real)
+// ============================================================
+if (!global.recentConfigs) global.recentConfigs = new Set();
+const MAX_RECENT_CONFIGS = 5;
+
+function rememberConfig(configB64) {
+    if (!configB64) return;
+    global.recentConfigs.add(configB64);
+    if (global.recentConfigs.size > MAX_RECENT_CONFIGS) {
+        const first = global.recentConfigs.values().next().value;
+        global.recentConfigs.delete(first);
+    }
+}
+
+// Um único envio de get_events (mantém sessão viva)
+async function sendKeepAlive(list) {
+    try {
+        const auth = await engine.authenticate(list, list.proxy);
+        if (!auth || !auth.api || !auth.token) return false;
+
+        const url = `${auth.api}type=stb&action=get_events&event_active_id=0&init=0&sn=${auth.authData.sn}&token=${auth.token}&JsHttpRequest=1-0`;
+        const res = await axios.get(url, engine.getAxiosOpts(list, {
+            headers: auth.authData.headers,
+            timeout: 4000
+        }));
+
+        // Se o portal devolveu novo token, atualiza a cache
+        const newToken = res.data?.js?.token;
+        if (newToken && newToken !== auth.token) {
+            auth.token = newToken;
+            auth.authData.headers['Authorization'] = `Bearer ${newToken}`;
+            auth.authData.headers.Cookie = auth.authData.headers.Cookie.replace(/token=[^;]+/, `token=${newToken}`);
+            auth.authData.headers.Cookie = auth.authData.headers.Cookie.replace(/access_token=[^;]+/, `access_token=${newToken}`);
+        }
+
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+// Loop background — a cada 2 minutos para cada portal conhecido
+setInterval(async () => {
+    for (const cfgB64 of global.recentConfigs) {
+        try {
+            const lists = addon.parseConfig(cfgB64);
+            for (const list of lists) {
+                if (list.type !== 'stalker') continue;
+                const ok = await sendKeepAlive(list);
+                if (ok) {
+                    console.log(`[KEEPALIVE] ✅ ${list.name || list.url} — sessão viva`);
+                }
+            }
+        } catch(e) { /* ignorar */ }
+    }
+}, 2 * 60 * 1000);   // 2 minutos
+
 const PORT = process.env.PORT || 7860;
 const app = express();
 
@@ -35,6 +125,11 @@ setInterval(() => {
         });
     }
 }, 30000);
+
+app.get("/ping", (req, res) => {
+    console.log(`[PING] ${new Date().toISOString()}`);
+    res.status(200).send("pong");
+});
 
 // Página de Configuração (inalterada)
 app.get("/", (req, res) => res.redirect("/configure"));
@@ -65,8 +160,22 @@ app.get("/configure", (req, res) => {
             .close-modal:hover { color: white; }
             .cat-group { margin: 15px 0; }
             .cat-group h4 { color: #007bff; margin: 10px 0 5px; }
-            .cat-checkbox { margin: 3px 0; display: flex; align-items: center; }
-            .cat-checkbox input { width: auto; margin-right: 8px; }
+            .cat-section { margin: 8px 0; border: 1px solid #252740; border-radius: 6px; overflow: hidden; }
+            .cat-section-header { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #1e2035; cursor: pointer; user-select: none; }
+            .cat-section-header:hover { background: #252740; }
+            .cat-section-header strong { color: #007bff; font-size: 13px; flex: 1; }
+            .cat-section-header .hint { color: #666; font-size: 11px; }
+            .cat-section-header .chevron { color: #007bff; font-size: 11px; transition: transform 0.2s; display: inline-block; }
+            .cat-section-header .chevron.open { transform: rotate(180deg); }
+            .cat-section-body { padding: 6px 8px; display: none; }
+            .cat-checkbox { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+            .cat-checkbox input[type="checkbox"] { width: auto; margin: 0; }
+            .cat-checkbox label { display: flex; align-items: center; gap: 8px; cursor: pointer; color: #ddd; font-size: 13px; flex: 1; min-width: 0; }
+            .cat-checkbox label span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            .cat-master { width: auto; margin: 0; }
+            .cat-rename { flex: 1; min-width: 0; padding: 4px 6px; border-radius: 4px; border: 1px solid #333; background: #0f1120; color: #aaa; font-size: 11px; box-sizing: border-box; }
+            .cat-rename:focus { border-color: #007bff; outline: none; color: #fff; }
+            .cat-rename::placeholder { color: #555; font-style: italic; }
             .loading-spinner { text-align: center; color: #aaa; }
         </style></head>
         <body>
@@ -240,17 +349,47 @@ app.get("/configure", (req, res) => {
                             const saved = selectedCategories[i] || { tv: [], movie: [], series: [] };
 
                             ['tv', 'movie', 'series'].forEach(type => {
-                                const typeLabel = type === 'tv' ? 'TV' : (type === 'movie' ? 'Filmes' : 'Séries');
-                                html += \`<p style="color:#aaa; margin:8px 0 2px;">\${typeLabel}:</p>\`;
-                                if (cats[type] && cats[type].length > 0) {
-                                    cats[type].forEach(cat => {
-                                        const checked = saved[type].includes(cat) ? 'checked' : '';
-                                        html += \`<div class="cat-checkbox"><label><input type="checkbox" class="cat-check" data-list="\${i}" data-type="\${type}" value="\${cat}" \${checked}> \${cat}</label></div>\`;
-                                    });
-                                } else {
-                                    html += '<p style="color: #666; font-size:12px;">Nenhuma categoria disponível</p>';
-                                }
-                            });
+    const typeLabel = type === 'tv' ? 'TV' : (type === 'movie' ? 'Filmes' : 'Séries');
+    const groupId = \`\${i}_\${type}\`;
+    const isFirstConfig = !selectedCategories[i];
+    const savedList = (selectedCategories[i] && selectedCategories[i][type]) ? selectedCategories[i][type] : [];
+    const total = cats[type] ? cats[type].length : 0;
+
+    html += \`<div class="cat-section">
+        <div class="cat-section-header" onclick="toggleSection('\${groupId}')">
+            <input type="checkbox" class="cat-master" data-group="\${groupId}" \${isFirstConfig ? 'checked' : ''} onclick="event.stopPropagation();" onchange="toggleAllCats('\${groupId}', this.checked)">
+            <strong>\${typeLabel}</strong>
+            <span class="hint">\${total} categorias</span>
+            <span class="chevron" id="chev-\${groupId}">▼</span>
+        </div>
+        <div class="cat-section-body" id="body-\${groupId}">\`;
+
+    if (total > 0) {
+        cats[type].forEach(cat => {
+            let isChecked = isFirstConfig ? true : false;
+            let customName = '';
+            for (const item of savedList) {
+                if (typeof item === 'string' && item === cat) { isChecked = true; break; }
+                if (item && item.original === cat) {
+                    isChecked = true;
+                    if (item.custom && item.custom !== cat) customName = item.custom;
+                    break;
+                }
+            }
+            html += \`<div class="cat-checkbox">
+                <label>
+                    <input type="checkbox" class="cat-check" data-list="\${i}" data-type="\${type}" data-group="\${groupId}" value="\${cat}" \${isChecked ? 'checked' : ''} onchange="updateMasterCheckbox('\${groupId}')">
+                    <span title="\${cat}">\${cat}</span>
+                </label>
+                <input type="text" class="cat-rename" data-list="\${i}" data-type="\${type}" data-original="\${cat}" placeholder="novo nome" value="\${customName}">
+            </div>\`;
+        });
+    } else {
+        html += '<p style="color: #555; font-size:11px; margin:2px 0;">Sem categorias</p>';
+    }
+
+    html += '</div></div>';
+});
                         } catch (e) {
                             html += '<p style="color: red;">Erro ao obter categorias</p>';
                         }
@@ -263,20 +402,52 @@ app.get("/configure", (req, res) => {
                     document.getElementById('categoryModal').style.display = 'none';
                 }
 
+                function toggleSection(groupId) {
+    const body = document.getElementById('body-' + groupId);
+    const chev = document.getElementById('chev-' + groupId);
+    if (!body) return;
+    if (body.style.display === 'block') {
+        body.style.display = 'none';
+        if (chev) chev.classList.remove('open');
+    } else {
+        body.style.display = 'block';
+        if (chev) chev.classList.add('open');
+    }
+}
+
+function toggleAllCats(groupId, checked) {
+    document.querySelectorAll(\`.cat-check[data-group="\${groupId}"]\`).forEach(cb => {
+        cb.checked = checked;
+    });
+}
+
+function updateMasterCheckbox(groupId) {
+    const all = document.querySelectorAll(\`.cat-check[data-group="\${groupId}"]\`);
+    const checked = document.querySelectorAll(\`.cat-check[data-group="\${groupId}"]:checked\`);
+    const master = document.querySelector(\`.cat-master[data-group="\${groupId}"]\`);
+    if (master) {
+        master.checked = all.length > 0 && all.length === checked.length;
+        master.indeterminate = checked.length > 0 && checked.length < all.length;
+    }
+}
+
                 function saveCategories() {
-                    const checks = document.querySelectorAll('.cat-check:checked');
-                    const newSelection = {};
-                    checks.forEach(cb => {
-                        const listIdx = parseInt(cb.dataset.list);
-                        const type = cb.dataset.type;
-                        const value = cb.value;
-                        if (!newSelection[listIdx]) newSelection[listIdx] = { tv: [], movie: [], series: [] };
-                        newSelection[listIdx][type].push(value);
-                    });
-                    selectedCategories = newSelection;
-                    closeCategoryModal();
-                    alert('Categorias selecionadas guardadas!');
-                }
+    const newSelection = {};
+    document.querySelectorAll('.cat-checkbox').forEach(div => {
+        const cb = div.querySelector('.cat-check');
+        if (!cb || !cb.checked) return;
+        const renameInput = div.querySelector('.cat-rename');
+        const listIdx = parseInt(cb.dataset.list);
+        const type = cb.dataset.type;
+        const original = cb.value;
+        const custom = renameInput && renameInput.value.trim() ? renameInput.value.trim() : original;
+        if (!newSelection[listIdx]) newSelection[listIdx] = { tv: [], movie: [], series: [] };
+        newSelection[listIdx][type].push({ original, custom });
+    });
+    selectedCategories = newSelection;
+    closeCategoryModal();
+    alert('Categorias selecionadas guardadas!');
+}
 
                 function getListDataFromBox(box) {
                     const type = box.querySelector('.type').value;
@@ -329,8 +500,248 @@ app.get("/configure", (req, res) => {
 });
 
 // Rotas do Stremio
-app.get("/:config/manifest.json", async (req, res) => res.json(await addon.getManifest(req.params.config)));
+/*
+// ===== METADATA SHIELD =====
+app.get("/meta/:config/:listIdx/:channelId", async (req, res) => {
+    const { config, listIdx, channelId } = req.params;
+    const type = req.query.type || 'tv';
+    const lists = addon.parseConfig(config);
+    const configData = lists[listIdx];
+    if (!configData) return res.status(400).end();
+
+    const key = `${config.slice(0,20)}_${channelId}`;
+    if (!global.metaShield) global.metaShield = {};
+    const now = Date.now();
+
+        // 2º pedido em < 60s = reprodução
+    if (global.metaShield[key] && now - global.metaShield[key] < 60000) {
+        const realUrl = global.metaShield[key + '_real'];
+        if (!realUrl) return res.status(500).end();
+
+        global.metaShield[key + '_hits'] = (global.metaShield[key + '_hits'] || 0) + 1;
+        const hits = global.metaShield[key + '_hits'];
+
+        // ===== PRE-LOCK SINCRONO (só 1 vez por sessão) =====
+        if (!global.metaShield[key + '_prelock_done']) {
+            console.log(`[META-SHIELD] Hit ${hits} → pre-lock sincrono (a aquecer portal)`);
+            try {
+                const auth = global.metaShield[key + '_auth'] || await engine.authenticate(configData, configData.proxy);
+                if (auth) {
+                    const streamHeaders = {
+                        ...auth.authData.headers,
+                        'Referer': configData.url.replace(/\/$/, '') + '/c/',*/
+                       // 'Accept': '*/*',
+                     /*   'Connection': 'keep-alive'
+                    };
+                    const preRes = await axios.get(realUrl, { headers: streamHeaders, responseType: 'stream', timeout: 8000 });
+                    let buf = Buffer.alloc(0);
+                    await new Promise((resolve) => {
+                        const t = setTimeout(resolve, 3000);
+                        preRes.data.on('data', (chunk) => {
+                            buf = Buffer.concat([buf, chunk]);
+                            if (buf.length >= 64 * 1024) {
+                                clearTimeout(t);
+                                preRes.data.pause();
+                                resolve();
+                            }
+                        });
+                        preRes.data.on('error', () => { clearTimeout(t); resolve(); });
+                    });
+                    global.metaShield[key + '_prelock_source'] = preRes.data;
+                    global.metaShield[key + '_prelock_done'] = true;
+                    console.log(`[PRE-LOCK] ✅ ${buf.length} bytes lidos — portal quente`);
+                }
+            } catch(e) {
+                console.log(`[PRE-LOCK] Falhou: ${e.message}`);
+            }
+        } // Fim do PRE-LOCK SINCRONO
+
+        // Hits 4+: pre-lock (fallback)
+if (!global.metaShield[key + '_prelock']) {
+    global.metaShield[key + '_prelock'] = true;
+    (async () => {
+        try {
+            const auth = global.metaShield[key + '_auth'] || await engine.authenticate(configData, configData.proxy);
+            if (!auth) return;
+            const streamHeaders = {
+                ...auth.authData.headers,
+                'Referer': configData.url.replace(/\/$/, '') + '/c/',*/
+               // 'Accept': '*/*',
+              /*  'Connection': 'keep-alive'
+            };
+            const preRes = await axios.get(realUrl, { headers: streamHeaders, responseType: 'stream', timeout: 8000 });
+            let buf = Buffer.alloc(0);
+            const preSource = preRes.data;
+            preSource.on('data', (chunk) => {
+                buf = Buffer.concat([buf, chunk]);
+                if (buf.length >= 64 * 1024) {
+                    preSource.pause();
+                    console.log(`[PRE-LOCK] Hit ${hits} → pre-lock ativo (${buf.length} bytes)`);
+                }
+            });
+            preSource.on('error', () => {});
+            global.metaShield[key + '_prelock_source'] = preSource;
+            setTimeout(() => {
+                try { preSource.destroy(); } catch(e) {}
+                delete global.metaShield[key + '_prelock_source'];
+                delete global.metaShield[key + '_prelock'];
+            }, 60000);
+        } catch(e) {
+            console.log(`[PRE-LOCK] Falhou: ${e.message}`);
+        }
+    })();
+}
+
+        // ÚNICO REDIRECT (substitui os dois que existiam e fecha o IF)
+        console.log(`[META-SHIELD] Hit ${hits} → redirect efetuado`);
+        return res.redirect(302, realUrl);
+    } 
+
+    // 1º pedido = metadata
+    global.metaShield[key] = now;
+
+
+    // Cria o URL real do portal em background
+    try {
+        const auth = await engine.authenticate(configData, configData.proxy);
+        if (!auth) return res.status(401).end();
+        const stalkerCmd = decodeURIComponent(channelId);
+        let streamUrl = await engine.createStreamLink(auth, configData, stalkerCmd, 'tv', null);
+        if (streamUrl && streamUrl.trim()) {
+            global.metaShield[key + '_auth'] = auth;
+            global.metaShield[key + '_real'] = streamUrl.trim();
+            global.metaShield[key + '_hits'] = 0;
+            console.log(`[META-SHIELD] URL real guardado (limpo): ${streamUrl.substring(0, 70)}...`);
+        }
+    } catch(e) {
+        console.error(`[META-SHIELD] Erro ao criar link: ${e.message}`);
+    }
+
+    // Responde com fake TS + Set-Cookie
+    const fakeTs = Buffer.alloc(188, 0);
+    fakeTs[0] = 0x47;
+    const mac = (configData.mac || '').toUpperCase();
+    let cookieDomain = '';
+    try { cookieDomain = new URL(configData.url).hostname; } catch(e) {}
+
+    res.writeHead(200, {
+        'Content-Type': 'video/mp2t',
+        'Content-Length': fakeTs.length,
+        'Connection': 'close',
+        'Set-Cookie': `mac=${encodeURIComponent(mac)}; Path=/; Domain=${cookieDomain}; Max-Age=600`
+    });
+    res.end(fakeTs);
+});
+
+setInterval(() => {
+    if (!global.metaShield) return;
+    const now = Date.now();
+    Object.keys(global.metaShield).forEach(k => {
+        if (typeof global.metaShield[k] === 'number' && now - global.metaShield[k] > 120000) {
+            if (global.metaShield[k + '_prelock_source'] && global.metaShield[k + '_prelock_source'].destroy) {
+                try { global.metaShield[k + '_prelock_source'].destroy(); } catch(e) {}
+            }
+            delete global.metaShield[k];
+            delete global.metaShield[k + '_real'];
+            delete global.metaShield[k + '_auth'];
+            delete global.metaShield[k + '_hits'];
+            delete global.metaShield[k + '_prelock'];
+            delete global.metaShield[k + '_prelock_source'];
+        }
+    });
+}, 60000);
+*/
+
+
+// ===== METADATA SHIELD: responde ao metadata probe do Tizen sem tocar no portal =====
+app.get("/meta/:config/:listIdx/:channelId", async (req, res) => {
+    const { config, listIdx, channelId } = req.params;
+    const type = req.query.type || 'tv';
+    const lists = addon.parseConfig(config);
+    const configData = lists[listIdx];
+    if (!configData) return res.status(400).end();
+
+    // Se já vimos este pedido antes (o 2º do Tizen) → redireciona para o portal real
+    const key = `${config.slice(0,20)}_${channelId}`;
+    if (!global.metaShield) global.metaShield = {};
+    const now = Date.now();
+
+    // Se já redirecionámos 1 vez, deixamos o Tizen "preso" com fake TS para ele não reabrir
+if (global.metaShield[key] && now - global.metaShield[key] < 60000) {
+    const redirectCount = global.metaShield[key + '_redirects'] || 0;
+    const realUrl = global.metaShield[key + '_real'];
+
+    if (redirectCount < 1 && realUrl) {
+        global.metaShield[key + '_redirects'] = redirectCount + 1;
+        console.log(`[META-SHIELD] Redirecionar #${redirectCount + 1} → portal`);
+        return res.redirect(302, realUrl);
+    }
+
+    // Já redirecionámos antes → Tizen está a insistir, damos fake TS para desistir
+    console.log(`[META-SHIELD] Tizen insistiu (${redirectCount + 1}º) → fake TS`);
+    const fakeTs = Buffer.alloc(188, 0);
+    fakeTs[0] = 0x47;
+    res.writeHead(200, {
+        'Content-Type': 'video/mp2t',
+        'Content-Length': fakeTs.length,
+        'Connection': 'close'
+    });
+    return res.end(fakeTs);
+}
+
+    // 1º pedido = metadata → responde com fake TS header
+    global.metaShield[key] = now;
+    console.log(`[META-SHIELD] 1º pedido (metadata) → a responder localmente`);
+
+    // Cria o URL real do portal em background (para o 2º pedido)
+    try {
+        const auth = await engine.authenticate(configData, configData.proxy);
+        if (!auth) return res.status(401).end();
+        const stalkerCmd = decodeURIComponent(channelId);
+        const linkUrl = `${auth.api}type=itv&action=create_link&cmd=${encodeURIComponent(stalkerCmd)}&sn=${auth.authData.sn}&token=${auth.token}&JsHttpRequest=1-0`;
+const linkRes = await axios.get(linkUrl, engine.getAxiosOpts(configData, { headers: auth.authData.headers, timeout: 5000 }));
+
+// Aplica a limpeza (corrige URLs mangled como crystalott)
+let streamUrl = extractUrlFix(linkRes.data?.js);
+
+if (streamUrl && streamUrl.trim()) {
+    global.metaShield[key + '_real'] = streamUrl.trim();
+    console.log(`[META-SHIELD] URL real guardado (limpo): ${streamUrl.substring(0, 70)}...`);
+}
+    } catch(e) {
+        console.error(`[META-SHIELD] Erro ao criar link: ${e.message}`);
+    }
+
+    // Responde com fake TS bytes (sync byte 0x47 + 187 bytes de zeros = 1 packet TS válido)
+    const fakeTs = Buffer.alloc(188, 0);
+    fakeTs[0] = 0x47; // Sync byte de um pacote MPEG-TS
+    res.writeHead(200, {
+        'Content-Type': 'video/mp2t',
+        'Content-Length': fakeTs.length,
+        'Connection': 'close'
+    });
+    res.end(fakeTs);
+});
+
+// Limpeza do metaShield a cada minuto
+setInterval(() => {
+    if (!global.metaShield) return;
+    const now = Date.now();
+    Object.keys(global.metaShield).forEach(k => {
+        if (typeof global.metaShield[k] === 'number' && now - global.metaShield[k] > 120000) {
+            delete global.metaShield[k];
+            delete global.metaShield[k + '_real'];
+            delete global.metaShield[k + '_redirects'];
+        }
+    });
+}, 60000);
+
+app.get("/:config/manifest.json", async (req, res) => {
+    rememberConfig(req.params.config);
+    res.json(await addon.getManifest(req.params.config));
+});
 app.get("/:config/catalog/:type/:id/:extra?.json", async (req, res) => {
+    rememberConfig(req.params.config);
     const { config, type, id, extra } = req.params;
     let extraObj = {};
     if (extra) {
@@ -343,6 +754,7 @@ app.get("/:config/catalog/:type/:id/:extra?.json", async (req, res) => {
 });
 app.get("/:config/meta/:type/:id.json", async (req, res) => res.json(await addon.getMeta(req.params.type, req.params.id, req.params.config)));
 app.get("/:config/stream/:type/:id.json", async (req, res) => {
+    rememberConfig(req.params.config);
     const host = req.headers.host;
     res.json(await addon.getStreams(req.params.type, req.params.id, req.params.config, host));
 });
